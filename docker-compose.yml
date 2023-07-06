@@ -1,0 +1,110 @@
+version: '3.6'
+services:
+  xen_stats:
+    build: ./exporter
+    container_name: xen_stats
+  grafana:
+    image: grafana/grafana
+    container_name: grafana-server
+    restart: always
+    depends_on:
+      - influxdb
+    environment:
+      - GF_SECURITY_ADMIN_USER=
+      - GF_SECURITY_ADMIN_PASSWORD=
+      - GF_INSTALL_PLUGINS=
+    links:
+      - influxdb
+    ports:
+      - '80:3000'
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./grafana/datasource.yaml:/etc/grafana/provisioning/datasources/default.yaml
+      - ./grafana/dashboard.yaml:/etc/grafana/provisioning/dashboards/default.yaml
+      - ./grafana/dashboards:/var/lib/grafana/dashboards
+
+  telegraf:
+    image: telegraf
+    container_name: telegraf
+    restart: always
+    volumes:
+    - ./telegraf.conf:/etc/telegraf/telegraf.conf:ro
+    depends_on:
+      - influxdb
+    links:
+      - influxdb
+    ports:
+    - '8125:8125'
+
+  influxdb:
+    image: influxdb:1.8-alpine
+    container_name: influxdb
+    restart: always
+    environment:
+      - INFLUXDB_DB=influx
+      - INFLUXDB_ADMIN_USER=
+      - INFLUXDB_ADMIN_PASSWORD=
+    ports:
+      - '8086:8086'
+    volumes:
+      - influxdb_data:/var/lib/influxdb
+
+  prometheus:
+    image: prom/prometheus
+    container_name: prometheus
+    ports:
+      - '9090:9090'
+    restart: unless-stopped
+    volumes:
+      - ./prometheus:/etc/prometheus/prometheus.yml
+      - prom_data:/prometheus
+
+  xen01:
+    container_name: xen01
+    image: xen_stats:latest
+    environment:
+      - XEN_HOST=IP
+      - XEN_USER=user
+      - XEN_PASSWORD=password
+      - XEN_SSL_VERIFY=false
+
+  xen02:
+    container_name: xen02
+    image: xen_stats:latest
+    environment:
+      - XEN_HOST=IP
+      - XEN_USER=user
+      - XEN_PASSWORD=password
+      - XEN_SSL_VERIFY=false
+
+  xen03:
+    container_name: xen03
+    image: xen_stats:latest
+    environment:
+      - XEN_HOST=IP
+      - XEN_USER=user
+      - XEN_PASSWORD=password
+      - XEN_SSL_VERIFY=false
+
+  xen04:
+    container_name: xen04
+    image: xen_stats:latest
+    environment:
+      - XEN_HOST=IP
+      - XEN_USER=user
+      - XEN_PASSWORD=password
+      - XEN_SSL_VERIFY=false
+
+  xen05:
+    container_name: xen05
+    image: xen_stats:latest
+    environment:
+      - XEN_HOST=IP
+      - XEN_USER=user
+      - XEN_PASSWORD=password
+      - XEN_SSL_VERIFY=false
+      
+volumes:
+  grafana_data: {}
+  influxdb_data: {}
+  prom_data: {}
