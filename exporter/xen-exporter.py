@@ -2,6 +2,7 @@ import base64
 import http.server
 import urllib.request
 import time
+import traceback
 import ssl
 import os
 import re
@@ -21,13 +22,13 @@ all_srs = set()
 def lookup_vm_name(vm_uuid, session):
     return session.xenapi.VM.get_name_label(session.xenapi.VM.get_by_uuid(vm_uuid))
 
-"""
+
 def lookup_sr_name_by_uuid(sr_uuid, session):
     try:
-       return session.xenapi.SR.get_name_label(session.xenapi.SR.get_by_uuid(sr_uuid))
+        return session.xenapi.SR.get_name_label(session.xenapi.SR.get_by_uuid(sr_uuid))
     except XenAPI.XenAPI.Failure:
-       return sr_uuid
-"""
+        return sr_uuid
+
 
 def lookup_host_name(host_uuid, session):
     return session.xenapi.host.get_name_label(
@@ -38,24 +39,62 @@ def lookup_host_name(host_uuid, session):
 def lookup_sr_uuid_by_ref(sr_ref, session):
     return session.xenapi.SR.get_uuid(sr_ref)
 
+
+def find_full_sr_uuid(beginning_uuid, xen, halt_on_no_uuid):
+    for i in range(0, 2):
+        uuid = list(filter(lambda x: x.startswith(beginning_uuid), all_srs))
+        if len(uuid) == 0:
+            all_srs.update(
+                set(
+                    map(
+                        lambda x: lookup_sr_uuid_by_ref(x, xen),
+                        xen.xenapi.SR.get_all(),
+                    )
+                )
+            )
+            continue  # skip the rest of the loop and try the search again
+        elif len(uuid) > 1:
+            raise Exception(f"Found multiple SRs starting with UUID {beginning_uuid}")
+        uuid = uuid[0]
+        return uuid
+    if halt_on_no_uuid:
+        raise Exception(f"Found no SRs starting with UUID {beginning_uuid}")
+
+
 def get_or_set(d, key, func, *args):
     if key not in d:
         d[key] = func(key, *args)
     return d[key]
 
-def collect_poolmaster():
-    xen_user = os.getenv("XEN_USER", "root")
-    xen_password = os.getenv("XEN_PASSWORD", "")
-    xen_host = os.getenv("XEN_HOST", "localhost")
-    verify_ssl = "false"
-    verify_ssl = True if verify_ssl.lower() == "true" else False
+
+def collect_poolmaster(
+    xen_user: str, xen_password: str, xen_host: str, verify_ssl: bool
+):
     try:
-       with Xen("https://" + xen_host, xen_user, xen_password, verify_ssl) as xen:
-          poolmaster = xen_host
+        with Xen("https://" + xen_host, xen_user, xen_password, verify_ssl) as xen:
+            poolmaster = xen_host
     except XenAPI.XenAPI.Failure as e:
-       ipPattern = re.compile('\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}')
-       poolmaster = re.findall(ipPattern,str(e))[0]
+        ipPattern = re.compile("\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}")
+        poolmaster = re.findall(ipPattern, str(e))[0]
     return poolmaster
+
+
+def collect_sr_usage(session: XenAPI.Session):
+    sr_records = session.xenapi.SR.get_all_records()
+    output = ""
+    for sr_record in sr_records.values():
+        sr_name_label = sr_record["name_label"]
+        sr_uuid = sr_record["uuid"]
+        if "physical_size" in sr_record:
+            output += f'xen_sr_physical_size{{sr_uuid="{sr_uuid}", sr="{sr_name_label}", type="{sr_record["type"]}", content_type="{sr_record["content_type"]}"}} {str(sr_record["physical_size"])}\n'
+
+        if "physical_utilisation" in sr_record:
+            output += f'xen_sr_physical_utilization{{sr_uuid="{sr_uuid}", sr="{sr_name_label}", type="{sr_record["type"]}", content_type="{sr_record["content_type"]}"}} {str(sr_record["physical_utilisation"])}\n'
+
+        if "virtual_allocation" in sr_record:
+            output += f'xen_sr_virtual_allocation{{sr_uuid="{sr_uuid}", sr="{sr_name_label}", type="{sr_record["type"]}", content_type="{sr_record["content_type"]}"}} {str(sr_record["virtual_allocation"])}\n'
+    return output
+
 
 class Xen:
     def __init__(self, url, username, password, verify_ssl):
@@ -100,8 +139,16 @@ def collect_metrics():
     verify_ssl = os.getenv("XEN_SSL_VERIFY", "true")
     verify_ssl = True if verify_ssl.lower() == "true" else False
 
-    xen_poolmaster = collect_poolmaster()
+    halt_on_no_uuid = os.getenv("HALT_ON_NO_UUID", "false")
+    halt_on_no_uuid = True if halt_on_no_uuid.lower() == "true" else False
+
     collector_start_time = time.perf_counter()
+    xen_poolmaster = collect_poolmaster(
+        xen_user=xen_user,
+        xen_password=xen_password,
+        xen_host=xen_host,
+        verify_ssl=verify_ssl,
+    )
 
     with Xen("https://" + xen_poolmaster, xen_user, xen_password, verify_ssl) as xen:
         url = f"https://{xen_host}/rrd_updates?start={int(time.time()-10)}&json=true&host=true&cf=AVERAGE"
@@ -136,6 +183,27 @@ def collect_metrics():
                 extra_tags["host"] = host
                 extra_tags["host_uuid"] = collector
 
+            if collector_type == "host" and "sr_" in metric_type:
+                x = metric_type.split("sr_")[1]
+                sr = get_or_set(srs, x.split("_")[0], lookup_sr_name_by_uuid, xen)
+                extra_tags["sr"] = sr
+                extra_tags["sr_uuid"] = x.split("_")[0]
+                metric_type = "sr_" + "_".join(x.split("_")[1:])
+
+            # Handle SR metrics which don't have a full UUID (and don't have sr_)
+            if (
+                collector_type == "host"
+                and len(metric_type.split("_")[-1]) == 8
+                and "_".join(metric_type.split("_")[0:-1]) in sr_metrics
+            ):
+                short_sr = metric_type.split("_")[-1]
+                long_sr = find_full_sr_uuid(short_sr, xen, halt_on_no_uuid)
+                if long_sr is not None:
+                    sr = get_or_set(srs, long_sr, lookup_sr_name_by_uuid, xen)
+                    extra_tags["sr"] = sr
+                    extra_tags["sr_uuid"] = long_sr
+                metric_type = "_".join(metric_type.split("_")[0:-1])
+
             if collector_type == "vm" and "vbd_" in metric_type:
                 x = metric_type.split("vbd_")[1]
                 extra_tags["vbd"] = x.split("_")[0]
@@ -169,6 +237,8 @@ def collect_metrics():
 
             tags = {f'{k}="{v}"' for k, v in extra_tags.items()}
             output += f"xen_{collector_type}_{metric_type}{{{', '.join(tags)}}} {metrics['data'][0]['values'][i]}\n"
+
+        output += collect_sr_usage(xen)
         collector_end_time = time.perf_counter()
         output += f"xen_collector_duration_seconds {collector_end_time - collector_start_time}\n"
         return output
@@ -179,10 +249,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
         super().__init__(request, client_address, server)
 
     def do_GET(self):
-        self.send_response(200)
-        self.send_header("Content-type", "text/plain")
-        self.end_headers()
-        self.wfile.write(collect_metrics().encode("utf-8"))
+        try:
+            metric_output = collect_metrics().encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-type", "text/plain")
+            self.end_headers()
+            self.wfile.write(metric_output)
+        except BaseException:
+            print(traceback.format_exc(), flush=True)
+            self.send_response(500)
 
 
 if __name__ == "__main__":
